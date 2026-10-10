@@ -1,0 +1,26 @@
+{
+  "start_balance": 10000,
+  "coins": 5,
+  "timezone": "America/New_York",
+
+  "fee_pct": 0.20,
+  "slippage_pct": 0.05,
+
+  "enter_score": 0.25,
+  "exit_score": -0.15,
+  "min_confidence": 0.45,
+
+  "risk_per_trade_pct": 0.75,
+  "max_position_pct": 25,
+  "stop_atr_mult": 2.5,
+  "min_stop_pct": 1.2,
+  "max_stop_pct": 5.0,
+  "target_r": 2.2,
+  "max_hold_hours": 48,
+
+  "daily_loss_limit_pct": 3.0,
+  "cooldown_min": 30,
+  "loss_streak_pause": 3,
+
+  "reset_counter": 0
+}

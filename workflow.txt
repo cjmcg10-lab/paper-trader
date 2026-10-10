@@ -1,0 +1,57 @@
+name: Trading bot
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: write
+
+concurrency:
+  group: trading-bot
+  cancel-in-progress: false
+
+jobs:
+  cycle:
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    steps:
+      - name: Run one trading cycle
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: |
+          URL="https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          git clone --quiet --depth 1 "$URL" app || { echo "Could not download the code. Will retry next cycle."; exit 0; }
+
+          # The bot's memory lives on a separate branch called "data".
+          git ls-remote --exit-code --heads "$URL" data >/dev/null 2>&1
+          found=$?
+          if [ "$found" -eq 0 ]; then
+            git clone --quiet --depth 1 --branch data "$URL" data || { echo "Could not load saved data. Will retry next cycle."; exit 0; }
+          elif [ "$found" -eq 2 ]; then
+            mkdir data
+          else
+            echo "Could not reach the repository. Will retry next cycle."; exit 0
+          fi
+
+          python3 app/bot.py --data data
+
+          cd data
+          [ -f dashboard.json ] || { echo "Nothing to save this cycle."; exit 0; }
+          rm -rf .git
+          git init --quiet
+          git checkout --quiet -b data
+          git add -A
+          git -c user.name="trading-bot" -c user.email="trading-bot@users.noreply.github.com" commit --quiet -m "Update $(date -u +%Y-%m-%dT%H:%MZ)"
+          git push --quiet --force "$URL" data || echo "Could not save this cycle. The next one will retry."
+
+          # GitHub switches off quiet schedules after 60 days. This asks it to keep ours on.
+          if [ "$(date -u +%H)" = "00" ]; then
+            FILE=$(basename "${GITHUB_WORKFLOW_REF%%@*}")
+            curl -fsS -o /dev/null -X PUT -H "Authorization: Bearer ${GH_TOKEN}" -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/workflows/${FILE}/enable" || true
+          fi
