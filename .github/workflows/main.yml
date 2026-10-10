@@ -28,8 +28,8 @@ jobs:
           git clone --quiet --depth 1 "$URL" app || { echo "Could not download the code. Will retry next cycle."; exit 0; }
 
           # The bot's memory lives on a separate branch called "data".
-          git ls-remote --exit-code --heads "$URL" data >/dev/null 2>&1
-          found=$?
+          found=0
+          git ls-remote --exit-code --heads "$URL" data >/dev/null 2>&1 || found=$?
           if [ "$found" -eq 0 ]; then
             git clone --quiet --depth 1 --branch data "$URL" data || { echo "Could not load saved data. Will retry next cycle."; exit 0; }
           elif [ "$found" -eq 2 ]; then
