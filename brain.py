@@ -312,8 +312,16 @@ def news_family(sym, items, engine):
 
 
 # ---- family 4: crowd mood -------------------------------------------------
-def mood_family(sym, fng, items):
+def mood_family(sym, fng, items, ls=None):
     parts, notes = [], []
+    if ls:
+        s = -squash(ls["z"], 1.5) * 0.6       # a lopsided crowd tends to get caught out
+        parts.append((0.4, s))
+        usual = "more than usual" if ls["z"] > 0.5 else "fewer than usual" if ls["z"] < -0.5 else "about normal"
+        tail = (". Crowded bets often unwind" if ls["z"] > 1 else
+                ". Few are positioned for a rise, which leaves room to climb" if ls["z"] < -1 else "")
+        notes.append((0.4 * s if abs(s) > 0.05 else 0.001,
+                      "%d%% of futures accounts are betting on a rise, %s%s" % (ls["long_pct"], usual, tail)))
     if fng:
         v = fng[0][1]
         contra = clamp((50 - v) / 60, -0.5, 0.5) if (v <= 30 or v >= 70) else 0.0
@@ -336,7 +344,7 @@ def mood_family(sym, fng, items):
                       % ("positive" if ss > 0.05 else "negative" if ss < -0.05 else "neutral", n)))
     tw = sum(w for w, _ in parts)
     score = sum(w * s for w, s in parts) / tw if tw else 0
-    return fam("mood", "Crowd mood", score, clamp(0.5 * tw + (0.1 if n else 0)), top_notes(notes),
+    return fam("mood", "Crowd mood", score, clamp(0.45 * tw + (0.1 if n else 0)), top_notes(notes),
                {"fear_greed": fng[0][1] if fng else None})
 
 
@@ -380,6 +388,10 @@ def onchain_family(sym, cm, stable, dex):
                           % (_money(abs(net)), "moved onto" if net > 0 else "left",
                              "coins moving to exchanges are usually there to be sold" if net > 0
                              else "coins leaving exchanges are usually being held")))
+        if d.get("fees_wow") is not None:
+            s = squash(d["fees_wow"], 40)
+            parts.append((0.25, s))
+            notes.append((0.25 * s, "Fees paid to use the network are %+.0f%% week over week" % d["fees_wow"]))
         if d.get("mvrv"):
             s = clamp((1.8 - d["mvrv"]) / 1.5, -0.6, 0.6)
             parts.append((0.10, s))
@@ -426,7 +438,7 @@ def macro_family(macro, age):
         _, _, r = _chg(macro["nq"], 86400)
         s = squash(r * 100, 1.0)
         parts.append((0.40, s))
-        notes.append((0.4 * s, "US tech stocks are %s over the past day. Crypto tends to move with them" % pct(r)))
+        notes.append((0.4 * s, "US stocks are %s over the past day. Crypto tends to move with them" % pct(r)))
     if macro.get("dxy"):
         _, _, r = _chg(macro["dxy"], 5 * 86400)
         s = -squash(r * 100, 0.8)
@@ -450,7 +462,7 @@ def macro_family(macro, age):
     conf = 0.2 + 0.4 * tw
     stale = now() - newest > 20 * 3600
     if macro.get("src") != "live" or stale:
-        conf *= 0.5
+        conf *= 0.6
     out = top_notes(notes)
     if stale:
         out = out[:2] + [note("Traditional markets are closed, so this reading is from their last session", 0)]

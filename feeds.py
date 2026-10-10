@@ -70,9 +70,11 @@ class Health:
     def __init__(self):
         self.items = {}
 
+    optional = set()        # sources that often refuse cloud servers; shown grey, not red
+
     def set(self, name, group, ok, note="", age=0):
-        self.items[name] = {"name": name, "group": group, "ok": bool(ok),
-                            "note": note, "age": int(age or 0)}
+        self.items[name] = {"name": name, "group": group, "ok": bool(ok), "note": note,
+                            "age": int(age or 0), "optional": name in self.optional}
 
     def run(self, name, group, fn, *a):
         try:
@@ -337,6 +339,7 @@ NEWS_FEEDS = [
     ("CNBC Economy", "macro", "https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=20910258"),
     ("Federal Reserve", "macro", "https://www.federalreserve.gov/feeds/press_all.xml"),
 ]
+Health.optional = {"Reddit r/CryptoCurrency", "Reddit r/Bitcoin"}
 SOCIAL_FEEDS = [
     ("Reddit r/CryptoCurrency", "social", "https://www.reddit.com/r/CryptoCurrency/hot/.rss?limit=30"),
     ("Reddit r/Bitcoin", "social", "https://www.reddit.com/r/Bitcoin/hot/.rss?limit=20"),
@@ -403,7 +406,9 @@ def parse_feed(text, source, kind):
 
 
 def fetch_feed(source, kind, url):
-    items = parse_feed(http(url, raw=True, timeout=10, limit=3_000_000), source, kind)
+    hdr = {"User-Agent": "paper-trader-dashboard/1.0 (personal read-only feed reader)"} \
+        if "reddit.com" in url else None
+    items = parse_feed(http(url, raw=True, timeout=10, limit=3_000_000, headers=hdr), source, kind)
     if not items:
         raise ValueError("no items")
     return items
@@ -455,6 +460,36 @@ def fetch_coinmetrics(sym):
     raise last
 
 
+def fetch_long_short(sym):
+    """Share of futures accounts betting on a rise, compared with its own past month."""
+    rows = http("https://www.okx.com/api/v5/rubik/stat/contracts/long-short-account-ratio"
+                "?ccy=%s&period=1H" % sym)["data"]
+    vals = [f(r[1]) for r in rows if f(r[1])]
+    if len(vals) < 48:
+        raise ValueError("too short")
+    import math
+    logs = [math.log(v) for v in vals]
+    mean = sum(logs) / len(logs)
+    sd = (sum((x - mean) ** 2 for x in logs) / len(logs)) ** 0.5 or 1e-9
+    return {"ratio": vals[0], "z": (logs[0] - mean) / sd, "long_pct": vals[0] / (1 + vals[0]) * 100}
+
+
+def fetch_network(sym):
+    """Network activity: address counts where published, otherwise fees paid on the chain."""
+    try:
+        return fetch_coinmetrics(sym)
+    except Exception:
+        if sym not in CHAINS:
+            raise
+    j = http("https://api.llama.fi/overview/fees/%s?excludeTotalDataChart=true"
+             "&excludeTotalDataChartBreakdown=true" % urllib.parse.quote(CHAINS[sym]), timeout=15)
+    a, b = f(j.get("total7d")), f(j.get("total14dto7d"))
+    if not a or not b:
+        raise ValueError("no fee data")
+    return {"t": now(), "adr": [], "tx": [], "fin": [], "fout": [], "mvrv": None,
+            "fees_wow": (a / b - 1) * 100}
+
+
 def fetch_stablecoins():
     j = http("https://stablecoins.llama.fi/stablecoincharts/all", timeout=20)
     rows = [[int(r["date"]), f(r["totalCirculatingUSD"]["peggedUSD"])] for r in j[-45:]]
@@ -482,17 +517,24 @@ def fetch_dex_volume(chain):
 # --------------------------------------------------------------------------
 YAHOO = {"nq": "NQ=F", "dxy": "DX-Y.NYB", "tnx": "^TNX", "vix": "^VIX"}
 FRED = {"nq": "NASDAQCOM", "dxy": "DTWEXBGS", "tnx": "DGS10", "vix": "VIXCLS"}
+MACRO_NAMES = {"nq": "stocks", "dxy": "dollar", "tnx": "rates", "vix": "volatility"}
 
 
 def _yahoo(symbol):
-    j = http("https://query1.finance.yahoo.com/v8/finance/chart/%s?interval=1h&range=1mo"
-             % urllib.parse.quote(symbol))
-    r = j["chart"]["result"][0]
-    rows = [[int(t), f(c)] for t, c in zip(r["timestamp"], r["indicators"]["quote"][0]["close"])]
-    rows = [x for x in rows if x[1]]
-    if len(rows) < 20:
-        raise ValueError("too short")
-    return rows[-200:]
+    last = None
+    for host in ("query1", "query2"):
+        try:
+            j = http("https://%s.finance.yahoo.com/v8/finance/chart/%s?interval=1h&range=1mo"
+                     % (host, urllib.parse.quote(symbol)))
+            r = j["chart"]["result"][0]
+            rows = [[int(t), f(c)] for t, c in zip(r["timestamp"], r["indicators"]["quote"][0]["close"])]
+            rows = [x for x in rows if x[1]]
+            if len(rows) < 20:
+                raise ValueError("too short")
+            return rows[-200:]
+        except Exception as e:
+            last = e
+    raise last
 
 
 def _fred(series):
@@ -510,19 +552,114 @@ def _fred(series):
     return rows
 
 
-def fetch_macro():
-    got = parallel({k: (lambda s=s: _yahoo(s)) for k, s in YAHOO.items()}, 4)
-    src = "live"
-    missing = [k for k in YAHOO if not got.get(k)]
-    if missing:
-        more = parallel({k: (lambda s=FRED[k]: _fred(s)) for k in missing}, 4)
-        got.update({k: v for k, v in more.items() if v})
-        src = "daily" if len(missing) == len(YAHOO) else "mixed"
-    got = {k: v for k, v in got.items() if v}
-    if not got:
-        raise ValueError("no macro data")
-    got["src"] = src
-    return got
+def _hl_candles(coin):
+    """Hourly candles for a market on Hyperliquid (open around the clock)."""
+    t = int(now() * 1000)
+    j = http("https://api.hyperliquid.xyz/info", data={"type": "candleSnapshot", "req": {
+        "coin": coin, "interval": "1h", "startTime": t - 12 * 86400 * 1000, "endTime": t}})
+    rows = [[int(r["t"]) // 1000, f(r["c"])] for r in j]
+    rows = [x for x in rows if x[1]]
+    if len(rows) < 20 or now() - rows[-1][0] > 6 * 3600:
+        raise ValueError("no recent candles")
+    return rows
+
+
+def _stocks_247():
+    last = None
+    for coin in ("xyz:XYZ100", "xyz:SP500", "flx:NDX"):
+        try:
+            return _hl_candles(coin)
+        except Exception as e:
+            last = e
+    raise last
+
+
+def _cboe(symbol, scale=1.0):
+    """Delayed quote from the Cboe exchange: yesterday's close and the latest price."""
+    d = http("https://cdn.cboe.com/api/global/delayed_quotes/quotes/%s.json" % symbol)["data"]
+    t = _when(str(d.get("last_trade_time", ""))[:19] + "-05:00")
+    cur, prev = f(d.get("current_price")), f(d.get("prev_day_close"))
+    if not cur or not prev or not t or now() - t > 4 * 86400:
+        raise ValueError("stale quote")
+    return [[int(t - 86400), prev * scale], [int(t), cur * scale]]
+
+
+def _euro_dollar():
+    """Dollar strength measured against the euro (rises when the dollar strengthens)."""
+    try:
+        rows = [[r[0], 1 / r[4]] for r in Kraken().candles("EUR", 60) if r[4]]
+    except Exception:
+        rows = [[r[0], 1 / r[4]] for r in Binance().candles("EUR", 60) if r[4]]
+    if len(rows) < 20 or now() - rows[-1][0] > 4 * 86400:
+        raise ValueError("stale")
+    return rows[-300:]
+
+
+def _treasury_10y():
+    year = datetime.fromtimestamp(now(), timezone.utc).year
+    text = http("https://home.treasury.gov/resource-center/data-chart-center/interest-rates/pages/"
+                "xml?data=daily_treasury_yield_curve&field_tdr_date_value=%d" % year, raw=True, timeout=20)
+    rows = []
+    for el in ET.fromstring(text.encode("utf-8")).iter():
+        if _tag(el) == "properties":
+            kv = {_tag(c): (c.text or "") for c in el}
+            t, v = _when(kv.get("new_date", "")[:19] + "+00:00"), f(kv.get("bc_10year"))
+            if t and v:
+                rows.append([int(t) + 21 * 3600, v])
+    rows.sort()
+    if not rows or now() - rows[-1][0] > 6 * 86400:
+        raise ValueError("no recent yields")
+    return rows[-30:]
+
+
+MACRO_CHAIN = {   # for each measure: sources to try in order, and whether each is intraday
+    "nq": [("yahoo", lambda: _yahoo(YAHOO["nq"]), True), ("hyperliquid", _stocks_247, True),
+           ("cboe", lambda: _cboe("_SPX"), False), ("fred", lambda: _fred(FRED["nq"]), False)],
+    "dxy": [("yahoo", lambda: _yahoo(YAHOO["dxy"]), True), ("euro", _euro_dollar, True),
+            ("fred", lambda: _fred(FRED["dxy"]), False)],
+    "tnx": [("yahoo", lambda: _yahoo(YAHOO["tnx"]), True), ("treasury", _treasury_10y, False),
+            ("cboe", lambda: _cboe("_TNX", 0.1), False), ("fred", lambda: _fred(FRED["tnx"]), False)],
+    "vix": [("yahoo", lambda: _yahoo(YAHOO["vix"]), True), ("cboe", lambda: _cboe("_VIX"), False),
+            ("fred", lambda: _fred(FRED["vix"]), False)],
+}
+
+
+def fetch_macro(state=None):
+    memo = (state or {}).setdefault("memo", {}).setdefault("macro", {})
+
+    def one(k):
+        errs = []
+        for name, fn, live in MACRO_CHAIN[k]:
+            try:
+                return name, fn(), live
+            except Exception as e:
+                errs.append("%s %s" % (name, err_text(e)))
+        print("economy data, %s: %s" % (MACRO_NAMES[k], "; ".join(errs)))   # shows in the run log
+        raise ValueError("; ".join(errs))
+
+    got = parallel({k: (lambda k=k: one(k)) for k in MACRO_CHAIN}, 4)
+    out, have = {}, []
+    for k, res in got.items():
+        if not res:
+            continue
+        name, rows, live = res
+        m = memo.get(k) or {}
+        if m.get("src") != name:            # never splice two different sources together
+            m = {"src": name, "rows": []}
+        merged = {r[0] // 3600: r for r in m["rows"]}
+        merged.update({r[0] // 3600: r for r in rows})
+        rows = [merged[b] for b in sorted(merged) if now() - merged[b][0] < 14 * 86400]
+        m["rows"] = rows[-340:]
+        memo[k] = m
+        out[k] = m["rows"]
+        have.append(k)
+        if k == "nq":
+            out["src"] = "live" if live else "daily"
+    if not have:
+        raise ValueError("no source answered")
+    out.setdefault("src", "daily")
+    out["have"] = [MACRO_NAMES[k] for k in have]
+    return out
 
 
 FOMC_FALLBACK = ["2026-10-28T18:00:00+00:00", "2026-12-09T19:00:00+00:00"]

@@ -119,7 +119,10 @@ def gather(state, cfg, H):
             lambda: feeds.fetch_okx_funding(s))
         tasks["cm:" + s] = lambda s=s: feeds.cached(
             state, H, "cm:" + s, "Network activity: " + s, "On-chain", 3 * 3600,
-            lambda: feeds.fetch_coinmetrics(s))
+            lambda: feeds.fetch_network(s))
+        tasks["ls:" + s] = lambda s=s: feeds.cached(
+            state, H, "ls:" + s, "Trader positioning: " + s, "Crowd mood", 1800,
+            lambda: feeds.fetch_long_short(s))
         if s in feeds.CHAINS:
             tasks["dex:" + s] = lambda s=s: feeds.cached(
                 state, H, "dex:" + s, "On-chain trading: " + s, "On-chain", 3 * 3600,
@@ -133,13 +136,16 @@ def gather(state, cfg, H):
     tasks["fng"] = lambda: feeds.cached(state, H, "fng", "Fear & Greed index", "Crowd mood", 3600,
                                         feeds.fetch_fear_greed)
     tasks["macro"] = lambda: feeds.cached(state, H, "macro", "Stocks, dollar, rates", "Economy",
-                                          900, feeds.fetch_macro)
+                                          900, lambda: feeds.fetch_macro(state))
     tasks["cal"] = lambda: feeds.cached(state, H, "cal", "Economic calendar", "Economy",
                                         12 * 3600, feeds.fetch_calendar)
     tasks["stable"] = lambda: feeds.cached(state, H, "stable", "Stablecoin supply", "On-chain",
                                            3 * 3600, feeds.fetch_stablecoins)
     raw = feeds.parallel(tasks, 12)
     raw["universe"] = uni
+    m = (raw.get("macro") or (None,))[0]
+    if m and H.items.get("Stocks, dollar, rates", {}).get("ok") and len(m.get("have", [])) < 4:
+        H.items["Stocks, dollar, rates"]["note"] = "have " + ", ".join(m["have"]) + " only"
     return raw
 
 
@@ -223,7 +229,7 @@ def analyse(state, cfg, raw, engine):
             dex = raw.get("dex:" + s)
             fams = [pa, brain.order_flow(s, c5, m["book"], deriv, state),
                     brain.news_family(s, state["news"], engine),
-                    brain.mood_family(s, fng, state["news"]),
+                    brain.mood_family(s, fng, state["news"], (raw.get("ls:" + s) or (None,))[0]),
                     brain.onchain_family(s, cm if cm and cm[0] else None, stable,
                                          dex if dex and dex[0] else None),
                     dict(macro_fam)]
