@@ -115,6 +115,11 @@ details[open]>summary .more{display:none} details:not([open])>summary .less{disp
 .item .when{font-size:12px;color:var(--ink3);white-space:nowrap}
 .glyph{display:inline-block;width:20px;font-size:13px}
 .grid3{display:grid;grid-template-columns:repeat(3,1fr);gap:14px 10px}
+.pick{display:flex;align-items:center;justify-content:space-between;gap:10px;font-size:13px;color:var(--ink2);margin:0 0 14px}
+.pick select{font:500 14px var(--sans);color:var(--ink);background:var(--soft);border:1px solid var(--line);border-radius:10px;
+  padding:8px 30px 8px 12px;min-height:38px;max-width:62%;-webkit-appearance:none;appearance:none;
+  background-image:linear-gradient(45deg,transparent 50%,var(--ink2) 50%),linear-gradient(135deg,var(--ink2) 50%,transparent 50%);
+  background-position:calc(100% - 16px) 55%,calc(100% - 11px) 55%;background-size:5px 5px;background-repeat:no-repeat}
 .linkbtn{font-size:14px;font-weight:600;color:var(--bot);padding:10px 0;min-height:44px}
 .src{display:flex;align-items:center;gap:10px;padding:8px 0;font-size:14px}
 .src .dot{background:var(--up)} .src.off .dot{background:var(--down)} .src.opt .dot{background:none;border:1.5px solid var(--ink3)}
@@ -215,6 +220,69 @@ async function load(){
   render();
 }
 
+/* ---------- exchange fees ----------
+   Each row is [30-day volume needed, market-order fee %, limit-order fee %].
+   Checked 9 Oct 2026. Kraken Pro, Coinbase Exchange and Binance are from their own fee pages;
+   Coinbase Advanced is from a third-party guide because its page needs a login. Edit freely. */
+const EXCH = {
+  base:    {name:"Average exchange"},
+  kraken:  {name:"Kraken Pro", tiers:[[0,.80,.40],[2500,.60,.30],[1e4,.38,.22],[25e3,.35,.20],[5e4,.30,.15],[1e5,.25,.12],[25e4,.22,.10],[5e5,.20,.08],[1e6,.18,.06],[25e5,.15,.04],[5e6,.12,.02],[1e7,.10,0]]},
+  cbadv:   {name:"Coinbase Advanced", tiers:[[0,1.20,.60],[1e3,.75,.35],[1e4,.40,.25],[5e4,.25,.15],[5e5,.20,.10],[1e6,.16,.07],[15e6,.14,.05],[1e8,.08,0]]},
+  cbex:    {name:"Coinbase Exchange", tiers:[[0,.60,.40],[1e4,.40,.25],[5e4,.25,.15],[1e5,.20,.10],[1e6,.18,.08],[15e6,.16,.06],[75e6,.10,.03],[25e7,.06,0],[4e8,.04,0]]},
+  binance: {name:"Binance", tiers:[[0,.10,.10]]},
+};
+let exch = "base";
+try { exch = localStorage.getItem("pt-exchange") || "base"; } catch(e){}
+if (!EXCH[exch]) exch = "base";
+function tierFor(ex, vol){ let r = ex.tiers[0]; for (const t of ex.tiers) if (vol >= t[0]) r = t; return r; }
+let V = null;
+/* Fees are a straight percentage of each buy and sell, so the account can be re-priced
+   exactly for any exchange: swap the fee on every fill and carry the difference forward. */
+function applyFees(){
+  const S = D.summary, ex = EXCH[exch], on = exch !== "base" && !!D.fills;
+  const F = (D.fills || []).map(f => ({t:f[0], usd:f[1], maker:f[2], paid:f[3], id:f[4]})).sort((a, b) => a.t - b.t);
+  const byId = {}, cum = []; let j = 0, vol = 0, run = 0, fees = 0;
+  for (const f of F){
+    while (F[j].t < f.t - 30*86400){ vol -= F[j].usd; j++; }
+    const t = on ? tierFor(ex, vol) : null, fee = on ? f.usd * (f.maker ? t[2] : t[1]) / 100 : f.paid;
+    vol += f.usd; run += f.paid - fee; fees += fee;
+    byId[f.id] = (byId[f.id] || 0) + (f.paid - fee); cum.push([f.t, run]);
+  }
+  let vol30 = 0; for (const f of F) if (f.t >= D.updated - 30*86400) vol30 += f.usd;
+  const at = t => { let d = 0; for (const c of cum){ if (c[0] <= t) d = c[1]; else break; } return d; };
+  const baseFee = D.rules.fee_pct / 100, slip = D.rules.slippage_pct / 100;
+  const bk = on ? (1 - ex.tiers[0][1]/100 - slip) / (1 - baseFee - slip) : 1;
+  let k = 0, d = 0;
+  const curve = D.equity.map(p => { while (k < cum.length && cum[k][0] <= p[0]){ d = cum[k][1]; k++; } return [p[0], p[1] + d, p[2] * bk]; });
+  const eq = S.equity + run, mid = new Date(); mid.setHours(0, 0, 0, 0);
+  const dayStart = (S.equity - S.day) + at((S.day_t || mid.getTime()/1000) - 1);
+  const stats = Object.assign({}, D.stats);
+  if (on){
+    const pn = (D.tlist || []).map(x => x[1] + (byId[x[0]] || 0));
+    const w = pn.filter(x => x > 0), l = pn.filter(x => x <= 0), gw = w.reduce((a, x) => a + x, 0), gl = -l.reduce((a, x) => a + x, 0);
+    let peak = S.start, dd = 0; for (const p of curve){ peak = Math.max(peak, p[1]); dd = Math.max(dd, (peak - p[1]) / peak * 100); }
+    Object.assign(stats, {wins:w.length, losses:l.length, win_rate: pn.length ? w.length / pn.length * 100 : null,
+      profit_factor: pn.length && gl > 0 ? gw / gl : null, max_drawdown: dd, fees});
+  }
+  const tier = on ? tierFor(ex, vol30) : null;
+  V = {on, name: ex.name, vol30, taker: on ? tier[1] : D.rules.fee_pct, maker: on ? tier[2] : D.rules.fee_pct, curve, stats,
+    S: Object.assign({}, S, {equity: eq, cash: S.cash + run, bench: S.bench * bk, pnl: eq - S.start, pnl_pct: (eq / S.start - 1) * 100,
+      day: eq - dayStart, day_pct: (eq / dayStart - 1) * 100}),
+    positions: D.positions.map(p => { const pnl = p.pnl + (byId[p.id] || 0); return Object.assign({}, p, {pnl, pct: pnl / p.cost * 100}); }),
+    trades: D.trades.map(t => { const x = byId[t.id] || 0, pnl = t.pnl + x; return Object.assign({}, t, {pnl, pct: pnl / t.cost * 100, fees: t.fees - x}); })};
+}
+const fmtFee = x => (+x.toFixed(3)) + "%";
+function feePicker(){
+  return h("label", {class:"pick"}, h("span", {style:"white-space:nowrap"}, "Exchange fees"),
+    h("select", {"aria-label":"Exchange used to price fees", onchange: e => { exch = e.target.value; try { localStorage.setItem("pt-exchange", exch); } catch(_){} render(); }},
+      Object.keys(EXCH).map(k => h("option", {value:k, selected: k === exch}, k === "base" ? "Average exchange (" + fmtFee(D.rules.fee_pct) + ")" : EXCH[k].name))));
+}
+function feeLine(){
+  if (!V.on) return "Every buy and sell is charged " + fmtFee(D.rules.fee_pct) + ", a typical mid-range exchange fee.";
+  return V.name + " at your 30-day trading volume of " + usd(V.vol30, 0) + ": " + fmtFee(V.taker) + " on market orders (buys, stop-losses, early exits) and " +
+    fmtFee(V.maker) + " on limit orders (profit targets). The rate drops as volume grows.";
+}
+
 /* ---------- header ---------- */
 function header(){
   const dot = $("dot"), age = $("age");
@@ -227,9 +295,9 @@ function header(){
 /* ---------- equity chart: bot vs simply holding ---------- */
 function equityChart(){
   const spans = {"1D":86400, "1W":7*86400, "All":1e12};
-  const end = D.equity.length ? D.equity[D.equity.length-1][0] : D.updated;
-  let pts = D.equity.filter(p => end - p[0] <= spans[range]);
-  if (pts.length < 2) pts = D.equity.slice(-2);
+  const E = V.curve, end = E.length ? E[E.length-1][0] : D.updated;
+  let pts = E.filter(p => end - p[0] <= spans[range]);
+  if (pts.length < 2) pts = E.slice(-2);
   const box = h("div");
   const vb = h("b", {class:"num"}), vr = h("b", {class:"num"}), when = h("span", {class:"small"});
   const legend = h("div", {class:"legend"}, h("span", null, h("i"), "Bot ", vb),
@@ -325,7 +393,7 @@ function feedItem(f){
     h("div", {class:"x", style:"padding-left:20px"}, f.text));
 }
 function renderNow(el){
-  const S = D.summary, late = (Date.now()/1000 - D.updated)/60;
+  const S = V.S, late = (Date.now()/1000 - D.updated)/60;
   if (late > 60) el.append(h("div", {class:"banner bad"}, "The bot last checked in " + ago(D.updated) + ". It should check in every few minutes. Open the Actions page of your GitHub repository to see whether runs are failing."));
   if (D.error && D.error.t >= D.updated) el.append(h("div", {class:"banner warn"}, "The latest run hit a problem (" + D.error.text + ") and will retry on the next cycle."));
   el.append(h("p", {class:"say"}, S.headline));
@@ -333,6 +401,7 @@ function renderNow(el){
   el.append(h("h2", null, "Account"));
   const gap = S.equity - S.bench;
   el.append(h("div", {class:"card"},
+    feePicker(),
     h("div", {class:"value num"}, usd(S.equity)),
     h("div", {class:"pair"},
       h("div", {class:"kv"}, h("div", {class:"k"}, "Since start"), h("div", {class:"v num " + tone(S.pnl)}, arrow(S.pnl) + sUsd(S.pnl) + " (" + pct(S.pnl_pct) + ")")),
@@ -342,9 +411,10 @@ function renderNow(el){
     h("div", {style:"margin-top:14px;display:flex;justify-content:space-between;align-items:center"},
       h("span", {class:"small num"}, usd(S.cash, 0) + " cash, " + usd(S.invested, 0) + " invested"),
       h("div", {class:"seg"}, ["1D","1W","All"].map(r => h("button", {"aria-pressed": String(r === range), onclick:() => { range = r; render(); }}, r)))),
-    equityChart()));
+    equityChart(),
+    h("p", {class:"small", style:"margin:12px 0 0"}, feeLine())));
   el.append(h("h2", null, D.positions.length ? "Open positions" : "Open positions: none"));
-  if (D.positions.length) el.append(h("div", {class:"card"}, D.positions.map(positionCard)));
+  if (D.positions.length) el.append(h("div", {class:"card"}, V.positions.map(positionCard)));
   if (D.events && D.events.length){
     const e = D.events[0];
     el.append(h("div", {class:"card note"}, "Next major US announcement: ", h("b", null, e.title), ", " + clock(e.t) +
@@ -380,22 +450,23 @@ function renderCoins(el){
 /* ---------- Activity ---------- */
 function stat(k, v, sub){ return h("div", {class:"kv"}, h("div", {class:"k"}, k), h("div", {class:"v num"}, v), sub ? h("div", {class:"small"}, sub) : null); }
 function renderActivity(el){
-  const s = D.stats, n = v => v == null ? "–" : v;
+  const s = V.stats;
   el.append(h("h2", null, "Results so far"));
-  el.append(h("div", {class:"card"}, h("div", {class:"grid3"},
+  el.append(h("div", {class:"card"}, feePicker(), h("div", {class:"grid3"},
     stat("Trades closed", s.trades, s.trades ? s.wins + " won, " + s.losses + " lost" : "none yet"),
     stat("Win rate", s.win_rate == null ? "–" : Math.round(s.win_rate) + "%"),
     stat("Won per $1 lost", s.profit_factor == null ? "–" : s.profit_factor > 20 ? "$20+" : "$" + s.profit_factor.toFixed(2)),
     stat("Biggest dip", "−" + s.max_drawdown.toFixed(1) + "%", "from a high"),
     stat("Costs paid", usd(s.fees + s.slippage, 0), usd(s.fees, 0) + " fees, " + usd(s.slippage, 0) + " slippage"),
     stat("Average hold", s.avg_hold_h == null ? "–" : dur(s.avg_hold_h))),
-    s.trades < 30 ? h("p", {class:"small", style:"margin:14px 0 0"}, "With fewer than 30 trades these numbers are mostly luck. Give it a few weeks before judging.") : null));
+    s.trades < 30 ? h("p", {class:"small", style:"margin:14px 0 0"}, "With fewer than 30 trades these numbers are mostly luck. Give it a few weeks before judging.") : null,
+    V.on ? h("p", {class:"small", style:"margin:10px 0 0"}, "Numbers here use " + V.name + " fees. The written decision notes below were recorded with the average fee, so their dollar amounts can differ slightly.") : null));
   el.append(h("div", {style:"margin:22px 0 10px"}, h("div", {class:"seg"},
     [["feed","Decisions"],["trades","Closed trades"]].map(([k, t]) => h("button", {"aria-pressed": String(actView === k), onclick:() => { actView = k; shown = 30; render(); }}, t)))));
   const more = n => n > shown ? h("button", {class:"linkbtn", onclick:() => { shown += 30; render(); }}, "Show older") : null;
   if (actView === "feed") el.append(h("div", {class:"card"}, D.feed.length ? D.feed.slice(0, shown).map(feedItem) : h("p", {class:"note"}, "Nothing yet."), more(D.feed.length)));
   else if (!D.trades.length) el.append(h("div", {class:"card note"}, "No trades have closed yet. They appear here with the reason for getting in and out."));
-  else el.append(h("div", {class:"card"}, D.trades.slice(0, shown).map(t => h("div", {class:"item"},
+  else el.append(h("div", {class:"card"}, V.trades.slice(0, shown).map(t => h("div", {class:"item"},
     h("div", {class:"row"}, h("span", {class:"t grow"}, t.sym, " ", h("span", {class:"small", style:"font-weight:400"}, clock(t.t_out))),
       h("span", {class:"num " + tone(t.pnl), style:"font-weight:600"}, arrow(t.pnl) + sUsd(t.pnl) + " (" + pct(t.pct) + ")")),
     h("div", {class:"x num"}, "In at " + px(t.entry) + ", out at " + px(t.exit) + " after " + dur((t.t_out - t.t_in)/3600) + ". Costs " + usd(t.fees + t.slip) + "."),
@@ -432,8 +503,10 @@ function renderSystem(el){
     h("li", null, "Stops opening trades for the day after losing " + R.daily_loss_limit_pct + "%, pauses after " + R.loss_streak_pause + " losses in a row, and stands aside around major US economic announcements."),
     h("li", null, "Never borrows and never bets on prices falling."))));
   el.append(h("h2", null, "Paper trading costs"));
-  el.append(h("div", {class:"card note"}, "No real money is involved. Each buy and sell is charged a ", h("b", null, R.fee_pct + "% fee"), " and at least ", h("b", null, R.slippage_pct + "% slippage"),
-    ", more when the order is large for what the live order book could absorb. Stop-losses slip twice as much. Starting balance " + usd(R.start_balance, 0) + ". Change these in config.json."));
+  el.append(h("div", {class:"card note"}, feePicker(), h("p", {style:"margin:0 0 10px"}, feeLine()),
+    "No real money is involved. On top of the fee, each buy and sell slips by at least ", h("b", null, R.slippage_pct + "%"),
+    ", more when the order is large for what the live order book could absorb. Stop-losses slip twice as much. Starting balance " + usd(R.start_balance, 0) +
+    ". Choosing an exchange re-prices every past and future trade with that exchange's published fees; it does not change which trades the bot makes."));
   el.append(h("h2", null, "Data sources: " + up + " of " + counted.length + " answering"));
   const groups = {}; for (const x of D.health) (groups[x.group] = groups[x.group] || []).push(x);
   el.append(h("div", {class:"card"}, Object.keys(groups).map(g => h("div", {style:"margin-bottom:10px"},
@@ -460,6 +533,7 @@ function render(){
     const el = $("tab-" + t); el.hidden = t !== tab; el.replaceChildren();
     if (t !== tab) continue;
     if (!D){ el.append(setup()); continue; }
+    applyFees();
     ({now:renderNow, coins:renderCoins, activity:renderActivity, news:renderNews, system:renderSystem})[t](el);
   }
   for (const d of document.querySelectorAll("#tab-coins details")) if (keepOpen.has(d.closest(".card").querySelector(".sym").firstChild.textContent)) d.open = true;

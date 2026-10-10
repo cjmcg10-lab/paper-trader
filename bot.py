@@ -129,7 +129,11 @@ def gather(state, cfg, H):
                 lambda: feeds.fetch_dex_volume(feeds.CHAINS[s]))
     tasks["hl"] = lambda: H.run("Futures positioning", "Futures", feeds.fetch_hyperliquid, syms)
     for name, kind, url in feeds.NEWS_FEEDS:
-        tasks["news:" + name] = lambda a=(name, kind, url): H.run(a[0], "News", feeds.fetch_feed, *a)
+        if name.startswith("Google News"):      # Google throttles frequent callers: ask less often
+            tasks["news:" + name] = lambda a=(name, kind, url): feeds.cached(
+                state, H, "news:" + a[0], a[0], "News", 900, lambda: feeds.fetch_feed(*a))[0]
+        else:
+            tasks["news:" + name] = lambda a=(name, kind, url): H.run(a[0], "News", feeds.fetch_feed, *a)
     for name, kind, url in feeds.SOCIAL_FEEDS:
         tasks["soc:" + name] = lambda a=(name, kind, url): feeds.cached(
             state, H, "soc:" + a[0], a[0], "Crowd mood", 900, lambda: feeds.fetch_feed(*a))
@@ -317,7 +321,7 @@ def trade(state, cfg, views, acct, blackout):
             d = eq - state["day"]["start"]
             say(state, "info", None, "Day closed " + ("up " if d >= 0 else "down ") + usd(abs(d)),
                 "Account finished %s at %s." % (state["day"]["date"], usd(eq)))
-        state["day"] = {"date": day, "start": eq, "limit_hit": False}
+        state["day"] = {"date": day, "start": eq, "limit_hit": False, "t": int(t)}
     day_pct = (eq / state["day"]["start"] - 1) * 100
     if day_pct <= -cfg["daily_loss_limit_pct"] and not state["day"]["limit_hit"]:
         state["day"]["limit_hit"] = True
@@ -493,7 +497,19 @@ def build_dashboard(state, cfg, views, stances, acct, H, engine, engine_note, ev
             "cost": p["cost"], "pnl": (price - p["entry"]) * p["qty"] - p["fee_in"],
             "pct": ((price - p["entry"]) * p["qty"] - p["fee_in"]) / p["cost"] * 100,
             "stop": p["stop"], "take": p["take"],
-            "stop0": p["stop0"], "trail": p["trail"], "t": int(p["t"]), "why": p["why"]})
+            "stop0": p["stop0"], "trail": p["trail"], "t": int(p["t"]), "why": p["why"],
+            "id": p["id"]})
+    # every buy and sell as [time, dollars, limit-order?, fee charged, trade id], so the
+    # dashboard can re-price the fees for whichever exchange is chosen there
+    fills = []
+    for x in A["trades"]:
+        gross = x["qty"] * x["exit"]
+        fee_in = x["fees"] * x["cost"] / (x["cost"] + gross)
+        fills.append([int(x["t_in"]), round(x["cost"], 2), 0, round(fee_in, 4), x["id"]])
+        fills.append([int(x["t_out"]), round(gross, 2), 1 if x["kind"] == "target" else 0,
+                      round(x["fees"] - fee_in, 4), x["id"]])
+    for p in A["positions"].values():
+        fills.append([int(p["t"]), round(p["cost"], 2), 0, round(p["fee_in"], 4), p["id"]])
     day_start = state["day"].get("start", start)
     holding = [p["sym"] for p in positions]
     watching = [c["sym"] for c in coins if not c["held"]]
@@ -518,6 +534,7 @@ def build_dashboard(state, cfg, views, stances, acct, H, engine, engine_note, ev
             "start": start, "pnl": round(eq - start, 2), "pnl_pct": round((eq / start - 1) * 100, 3),
             "bench": round(bench, 2), "bench_pct": round((bench / start - 1) * 100, 3),
             "day": round(eq - day_start, 2), "day_pct": round((eq / day_start - 1) * 100, 3),
+            "day_t": state["day"].get("t"),
             "status": "paused" if brake else "active", "headline": headline,
             "holding": holding, "watching": watching},
         "brief": state["brief"], "engine": {"mode": engine, "note": engine_note},
@@ -526,7 +543,8 @@ def build_dashboard(state, cfg, views, stances, acct, H, engine, engine_note, ev
         "trades": [{k: (int(v) if k in ("t_in", "t_out") else v) for k, v in x.items() if k != "snap"}
                    for x in reversed(A["trades"][-200:])],
         "feed": list(reversed(state["feed"][-150:])),
-        "equity": state["equity"],
+        "equity": state["equity"], "fills": fills,
+        "tlist": [[x["id"], round(x["pnl"], 2)] for x in A["trades"]],
         "stats": paper.stats(A, state["equity"], start),
         "news": news, "health": H.listing(),
         "rules": {k: cfg[k] for k in (
